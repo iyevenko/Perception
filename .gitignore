@@ -1,0 +1,4 @@
+# Project exclude paths
+/venv/
+/venv/lib/python3.8/
+/.idea/
