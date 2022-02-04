@@ -197,12 +197,12 @@ def make_cons(sdrs, same_axes, diff_axes, norm_axes, num_cons=1e4, reduce_same=T
             else:
                 coords_list = np.concatenate([coords_list, coords], axis=-1)
         else:
-            data = np.array(1, dtype=np.uint8)
+            data = np.array(1, dtype=np.int32)
             cons = sparse.COO(coords, data=data, shape=con_shape)
             cons_list.append(cons)
 
     if reduce_same:
-        data = np.array(1, dtype=np.uint8)
+        data = np.array(1, dtype=np.int32)
         sum_cons = sparse.COO(coords_list, data=data, shape=con_shape)
         return sum_cons
 
@@ -337,13 +337,12 @@ if __name__ == '__main__':
     # filters = sum_cons.coords.T
     # filters = sparse.argwhere(sum_cons > 2)
     # np.save('filters.npy', filters)
-
+    #
     # filters = np.load('filters.npy')
     # print(filters)
     # n = filters.shape[0]
     # print(n)
 
-    # filters = np.load('filters.npy')
     # i_max = filters[:, 0] + filters[:, 1]
     # j_max = filters[:, 3] + filters[:, 4]
     # r = np.sqrt(i_max**2 + j_max**2)
@@ -375,19 +374,37 @@ if __name__ == '__main__':
     cons2 = make_cons(sdrs2, same_axes=(3,), diff_axes=(0,), norm_axes=(0,1,2), num_cons=1e6, reduce_same=False)
 
     # cons2 => (C,2,H,W,2,H,W)
-    cons2 = sparse.stack(cons2)
-    filters = sparse.argwhere(cons2 > 100)
-    print(filters)
+    # cons2 = sparse.stack(cons2)
+    # sparse.save_npz('1_con2.npz', cons2)
 
-    useful_feats = np.unique(filters[:,0])
+    # cons2 = sparse.load_npz('1_con2.npz')
+    # maxs = cons2.max(axis=(1,2,3,4,5,6)).todense()
+    # i = np.argsort(maxs)[::-1]
+    # print(list(zip(i, maxs[i])))
 
-    filters = np.load('filters.npy')
-    for feat in useful_feats:
-        act = sdrs2[1,...,feat].todense()
-        plt.title(filters[feat])
-        plt.imshow(act)
-        plt.show()
+    # filters2 = sparse.argwhere(cons2 > 5000)
+    # print(filters2)
+    #
+    # useful_feats = np.unique(filters2[:,0])
+    #
+    # filters = np.load('filters.npy')
+    # acts = sdrs2.todense()
+    # for i in range(acts.shape[-1]):
+    #     sdr = acts[0,...,i]
+    #     plt.title(filters[i])
+    #     plt.imshow(sdr)
+    #     plt.imsave(f'acts/{i:03d}.png', sdr)
 
+
+
+    # for feat in useful_feats:
+    #     act = sdrs2[...,feat].todense()
+    #     _, ax = plt.subplots(1, 2)
+    #
+    #     ax[0].imshow(act[0])
+    #     ax[1].imshow(act[1])
+    #     plt.title(filters[feat])
+    #     plt.show()
 
 
 
