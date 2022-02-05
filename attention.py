@@ -1,14 +1,32 @@
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
-import cv2
 
 
-class Attention():
+class MaskContainer():
 
-    def __init__(self, tracker):
+    def __init__(self, mask_file=None):
+        if mask_file is not None:
+            self._masks = np.load(mask_file)
+
+    def get_mask_iter(self):
+        return iter(self._masks)
+
+    def get_mask(self, i):
+        return self._masks[i]
+
+    def save_masks(self, fname):
+        np.save(fname, self._masks)
+
+
+class Attention(MaskContainer):
+
+    def __init__(self, tracker, scale=1.0):
+        super().__init__()
         self.tracker = tracker
         self.H, self.W = tracker.H, tracker.W
+        self.scale = scale
         self.generate_masks()
 
     def generate_masks(self):
@@ -16,24 +34,21 @@ class Attention():
         xi = np.arange(self.H)
         xj = np.arange(self.W)
 
-        for x, y, sd in tracker.get_pts():
-            sdx = sd
-            sdy = sd * (self.W / self.H)
-            pi = stats.norm(x, sdx)
-            pj = stats.norm(y, sdy)
-            i = sdx * pi.pdf(xi).reshape(1, -1)
-            j = sdy * pj.pdf(xj).reshape(1, -1)
+        for x, y, r in self.tracker.get_pts():
+            sd = r * self.scale
+            sdi = sd
+            sdj = sd * (self.W / self.H)
+            pi = stats.norm(y, sdi)
+            pj = stats.norm(x, sdj)
+            i = sdi * pi.pdf(xi).reshape(1, -1)
+            j = sdj * pj.pdf(xj).reshape(1, -1)
 
             thresh = (i.T @ j) * 2 * np.pi
             rnd = np.random.uniform(0, 1, size=thresh.shape)
             mask = np.uint8(rnd < thresh)
             self._masks.append(mask)
 
-    def get_mask_iter(self):
-        return iter(self._masks)
-
-    def get_mask(self, i):
-        return self._masks[i]
+        self._masks = np.stack(self._masks)
 
 
 class Tracker():
@@ -76,7 +91,7 @@ class CubeTracker(Tracker):
         if len(contours) == 0:
             return [(self.H//2, self.W//2, self.DEFAULT_SD)]
 
-        (y, x), r = cv2.minEnclosingCircle(contours[0])
+        (x, y), r = cv2.minEnclosingCircle(contours[0])
         cx, cy = (int(x), int(y))
 
         if self.debug:
@@ -89,7 +104,7 @@ class CubeTracker(Tracker):
 
 
 if __name__ == '__main__':
-    tracker = CubeTracker('saved_episodes/1_noisy.npy')
+    tracker = CubeTracker('saved_episodes/1_noisy.npy', debug=True)
     attn = Attention(tracker)
     for i, mask in enumerate(attn.get_mask_iter()):
         plt.imsave(f'masks/{i:03d}.png', mask)

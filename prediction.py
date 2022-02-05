@@ -6,7 +6,9 @@ import matplotlib.pyplot as plt
 import sparse
 
 from tqdm import tqdm
-from simulation import setup, step
+import simulation as sim
+from utils import Timer
+from attention import Attention, CubeTracker, MaskContainer
 
 CUBE_PARAMS = {
     'side_len': 0.3,
@@ -14,9 +16,10 @@ CUBE_PARAMS = {
     'start_orn': p.getQuaternionFromEuler([0] * 3),
     'rgba': [1, 0, 0, 1]
 }
+
 def collect_episode(num_steps, save_path=None):
 
-    cube_id = setup(gui=True, gravity=-10, **CUBE_PARAMS)
+    cube_id = sim.setup(gui=True, gravity=-10, **CUBE_PARAMS)
 
     v = np.random.normal(scale=[2, 2, 2], size=(3,))
     w = np.random.normal(scale=10, size=(3,))
@@ -24,7 +27,7 @@ def collect_episode(num_steps, save_path=None):
 
     imgs = []
     for i in range(num_steps):
-        img = step()
+        img = sim.step()
         imgs.append(img)
         # time.sleep(1/240)
     imgs = np.stack(imgs)
@@ -79,7 +82,7 @@ def add_noise(ep_id=1):
     np.save(f'saved_episodes/{ep_id}_noisy.npy', x)
 
 
-def get_sdrs(w=1, ep_id=1, noisy=False):
+def get_sdrs(ep_id, w=1, attn=None, noisy=False):
     filename = f'saved_episodes/{ep_id}.npy' if not noisy else \
                f'saved_episodes/{ep_id}_noisy.npy'
     x = np.load(filename)[:,:,:,:3]
@@ -88,7 +91,13 @@ def get_sdrs(w=1, ep_id=1, noisy=False):
     sdr_list = []
     T = x.shape[0]
     for t in range(T):
-        sdr = rgb_to_sdr(x[t])
+        x_t = x[t]
+        if attn is not None:
+            mask = attn.get_mask(t)[...,np.newaxis]
+            x_t *= mask
+            # print(mask.sum()/mask.size)
+            plt.imsave(f'masks/{t:03d}.png', x_t)
+        sdr = rgb_to_sdr(x_t)
         sdr_list.append(sdr)
 
     sdrs = sparse.stack(sdr_list)
@@ -109,9 +118,9 @@ def make_cons(sdrs, same_axes, diff_axes, norm_axes, num_cons=1e4, reduce_same=T
 
         NOTE: If same_axes has more than one element, then connections will only be made if the indices for ALL axes are the same
         Ex. if same_axes=[0, 1] then
-            A[0,0,..] -> A[1,1,...]
-            A[0,0,..] -> A[0,1,...]
-            A[0,0,..] -> A[1,0,...]
+            A[0,0,...] -> A[1,1,...]
+            A[0,0,...] -> A[0,1,...]
+            A[0,0,...] -> A[1,0,...]
         are all invalid connections, but
             A[0,0,...] -> A[0,0,...]
         is valid
@@ -122,9 +131,9 @@ def make_cons(sdrs, same_axes, diff_axes, norm_axes, num_cons=1e4, reduce_same=T
 
         NOTE: If diff_axes has more than one element, then connections will only be made if the index for ANY axis is different
         Ex: if diff_axes=[0, 1] then
-            A[0,0,..] -> A[1,1,...]
-            A[0,0,..] -> A[0,1,...]
-            A[0,0,..] -> A[1,0,...]
+            A[0,0,...] -> A[1,1,...]
+            A[0,0,...] -> A[0,1,...]
+            A[0,0,...] -> A[1,0,...]
         are all valid connections, but
             A[0,0,...] -> A[0,0,...]
         is invalid
@@ -134,7 +143,7 @@ def make_cons(sdrs, same_axes, diff_axes, norm_axes, num_cons=1e4, reduce_same=T
         Ex: if norm_axes=[0] then A[i,...] -> A[j,...] becomes A[0,...] -> A[j-i,...], where i<j
 
     :param reduce_same: optional, bool
-        Whether or not to sum along the same axis. If true, the return value is a single sparse array, otherwise the return value is a list of sparse arrays
+        Whether to sum along the same axis. If true, the return value is a single sparse array, otherwise the return value is a list of sparse arrays
 
     :return:
     """
@@ -256,7 +265,7 @@ def make_connections(sdrs, p_con=1e-8, con_thresh=None):
     return filters
 
 
-def make_bitmask(filter, H, W, sdr_dim):
+def make_bitmask(filter, H, W, sdr_dim, attn_mask=None):
     # [i1, j1, k1, i2, j2, k2] -> [[[i1, i2], [j1, j2], [k1, k2]]]
     f = filter[[0, 3, 1, 4, 2, 5]].reshape((1, 3, 2))
 
@@ -267,9 +276,11 @@ def make_bitmask(filter, H, W, sdr_dim):
     W_out = W - jmax
     out_dim = H_out * W_out
 
-    r = np.arange(out_dim)
-    di = r // W_out
-    dj = r % W_out
+    idcs = np.indices((H_out, W_out)).reshape(2, -1)
+    if attn_mask is not None:
+        mask_idcs = attn_mask[:H_out, :W_out].flatten().astype(bool)
+        idcs = idcs[:,mask_idcs]
+    di, dj = idcs
 
     d = np.stack([di, dj, np.zeros_like(di), np.arange(di.size)], axis=-1)
     d = np.tile(d[:, :, np.newaxis], (1, 1, 2))
@@ -278,11 +289,15 @@ def make_bitmask(filter, H, W, sdr_dim):
     f = f + d
     f = f.transpose((1, 0, 2)).reshape((4, -1))
 
+
     sparse_mask = sparse.COO(f, data=True, shape=(H, W, sdr_dim, out_dim))
     return sparse_mask
 
 
-def apply_filters(sdrs, filters, match_thresh=0.5, timesteps=1):
+def apply_filters(sdrs, filters, masks=None, match_thresh=0.5, timesteps=1):
+    log_file = 'log.txt'
+    Timer.clear_logs(log_file)
+
     T, H, W, sdr_dim = sdrs.shape
     if timesteps < 0:
         timesteps = T
@@ -291,20 +306,30 @@ def apply_filters(sdrs, filters, match_thresh=0.5, timesteps=1):
 
     for i in tqdm(range(filters.shape[0])):
         filter = filters[i]
-        mask = make_bitmask(filter, H, W, sdr_dim)
 
         outs = []
         for t in range(timesteps):
-            sdr = sdrs[t,...,np.newaxis]
+            if masks is not None:
+                attn_mask = masks.get_mask(t)
+            else:
+                attn_mask = None
+            with Timer('MASK', log_file):
+                mask = make_bitmask(filter, H, W, sdr_dim, attn_mask=attn_mask)
+            with Timer('GET_SDR', log_file):
+                sdr = sdrs[t,...,np.newaxis]
 
             # Count matches and normalize by max # of matches
-            match = np.logical_and(sdr, mask)
-            match = np.sum(match, axis=(0, 1, 2))/2
+            with Timer('AND', log_file):
+                match = np.logical_and(sdr, mask)
+            with Timer('SUM', log_file):
+                match = np.sum(match, axis=(0, 1, 2))/2
             # *** Save match here for future credit assignment ***
 
             # Filter out matches below threshold and combine matches from the entire image into one boolean map
-            match = match > match_thresh
-            out = np.any(np.logical_and(mask, match), axis=(-2, -1))
+            with Timer('COMPARE', log_file):
+                match = match > match_thresh
+            with Timer('REDUCE', log_file):
+                out = np.any(np.logical_and(mask, match), axis=(-2, -1))
             outs.append(out)
 
         activations.append(sparse.stack(outs))
@@ -322,14 +347,17 @@ if __name__ == '__main__':
     # collect_episode(100, save_path=ep_path)
     # add_noise()
 
+    # tracker = CubeTracker('saved_episodes/1_noisy.npy')
+    # attn = Attention(tracker, scale=1.0)
+
     # Convert each RGB image into an SDR
-    # sdrs = get_sdrs(w=5, noisy=True)
-    # sdrs = sparse.load_npz('saved_episodes/1_sdr.npz')
+    # sdrs = get_sdrs(1, w=5, attn=attn, noisy=True)
+    # attn.save_masks('attn.npy')
+    sdrs = sparse.load_npz('saved_episodes/1_sdr.npz')
 
     # Connect random co-activated cells in different pixels
     # Normalize connections so only relative positions of the pixels matter
     # Save normalized connections as filters coordinates formatted as: (i1, j1, k1, i2, j2, k2)
-    # make_connections(sdrs)
     # sum_cons = make_cons(sdrs, same_axes=(0,), diff_axes=(1,2), norm_axes=(1,2), num_cons=5e5)
     # sparse.save_npz('1_con.npz', sum_cons)
 
@@ -338,7 +366,7 @@ if __name__ == '__main__':
     # filters = sparse.argwhere(sum_cons > 2)
     # np.save('filters.npy', filters)
     #
-    # filters = np.load('filters.npy')
+    filters = np.load('filters.npy')
     # print(filters)
     # n = filters.shape[0]
     # print(n)
@@ -354,24 +382,32 @@ if __name__ == '__main__':
     # # Turn filter coordinates into bitmasks and sweep  them across the image like a 2D convolution
     # # Resulting match arrays are [0, 1] float values that indicate the fraction of masked cells in the sdr that are active (i.e. sum(sdr * mask)/sum(mask))
     # # Match arrays are then converted to binary arrays by checking whether each value is below or above some threshold
-    # # (e.g. MAX_THRESH=0.8 corresponds to checking if 80% of values match)
+    # # (e.g. MATCH_THRESH=0.8 corresponds to checking if 80% of values match)
     # filters = np.array([[0, 0, 260, 0, 1, 260]])
-    # MATCH_THRESH = 0.8
-    # activations = apply_filters(sdrs, filters, match_thresh=MATCH_THRESH, timesteps=2)
+    MATCH_THRESH = 0.8
+    masks = MaskContainer('attn.npy')
+    activations = apply_filters(sdrs, filters, masks=masks, match_thresh=MATCH_THRESH, timesteps=2)
+
+    sdrs2 = sparse.stack(activations)
+    # sdrs2 = sparse.moveaxis(sdrs2, 0, -1)
+    # print(sdrs2.shape)
+    # sparse.save_npz('saved_episodes/1_sdr2.npz', sdrs2)
+
+    for i, act in enumerate(sdrs2.todense()):
+        # plt.title(filters[i])
+        # plt.imshow(act[0])
+        # plt.savefig(f'acts/{i:03d}.png')
+        plt.imsave(f'acts/{i:03d}.png', act[0])
 
     # sorted_activations = sorted(activations, key=lambda x: x[0].nnz, reverse=True)
     # for i in range(1):
     #     plt.imshow(activations[i][0].todense())
     #     plt.show()
 
-    # sdrs2 = sparse.stack(activations)
-    # sdrs2 = sparse.moveaxis(sdrs2, 0, -1)
-    # print(sdrs2.shape)
-    # sparse.save_npz('saved_episodes/1_sdr2.npz', sdrs2)
 
     # sdrs2 => (T,H,W,C)
-    sdrs2 = sparse.load_npz('saved_episodes/1_sdr2.npz')
-    cons2 = make_cons(sdrs2, same_axes=(3,), diff_axes=(0,), norm_axes=(0,1,2), num_cons=1e6, reduce_same=False)
+    # sdrs2 = sparse.load_npz('saved_episodes/1_sdr2.npz')
+    # cons2 = make_cons(sdrs2, same_axes=(3,), diff_axes=(0,), norm_axes=(0,1,2), num_cons=1e6, reduce_same=False)
 
     # cons2 => (C,2,H,W,2,H,W)
     # cons2 = sparse.stack(cons2)
